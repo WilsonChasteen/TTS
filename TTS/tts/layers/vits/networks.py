@@ -26,6 +26,140 @@ def get_padding(kernel_size, dilation=1):
     return int((kernel_size * dilation - dilation) / 2)
 
 
+class DepthwiseSeparableConv1d(nn.Module):
+    """Depthwise Separable Convolution for efficient local feature extraction."""
+    
+    def __init__(self, in_channels, out_channels, kernel_size, padding, dilation=1):
+        super().__init__()
+        self.depthwise = nn.Conv1d(
+            in_channels, in_channels, kernel_size, 
+            padding=padding, dilation=dilation, groups=in_channels
+        )
+        self.pointwise = nn.Conv1d(in_channels, out_channels, 1)
+        self.norm = nn.LayerNorm(out_channels)
+        self.activation = nn.GELU()
+        
+    def forward(self, x):
+        # x: [B, C, T]
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        # Transpose for LayerNorm: [B, C, T] -> [B, T, C]
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        x = self.activation(x)
+        # Back to [B, C, T]
+        x = x.transpose(1, 2)
+        return x
+
+
+class CausalConvBlock(nn.Module):
+    """Causal convolution block for fast local feature extraction."""
+    
+    def __init__(self, channels, kernel_size=5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = kernel_size - 1  # Causal padding
+        
+        self.conv1 = DepthwiseSeparableConv1d(
+            channels, channels, kernel_size, padding=self.padding
+        )
+        self.conv2 = DepthwiseSeparableConv1d(
+            channels, channels, kernel_size, padding=self.padding
+        )
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x, x_mask):
+        # x: [B, C, T], x_mask: [B, 1, T]
+        residual = x
+        
+        # First conv with causal masking
+        x = self.conv1(x)
+        if self.padding > 0:
+            x = x[:, :, :-self.padding]  # Remove future frames
+        x = x * x_mask
+        x = self.dropout(x)
+        
+        # Second conv with causal masking
+        x = self.conv2(x)
+        if self.padding > 0:
+            x = x[:, :, :-self.padding]  # Remove future frames
+        x = x * x_mask
+        x = self.dropout(x)
+        
+        # Residual connection
+        x = x + residual
+        return x
+
+
+class LimitedContextTransformer(nn.Module):
+    """Single-layer transformer with limited context window for efficiency."""
+    
+    def __init__(self, hidden_channels, num_heads=4, context_window=32, dropout_p=0.1):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.num_heads = num_heads
+        self.context_window = context_window
+        
+        self.attention = nn.MultiheadAttention(
+            hidden_channels, num_heads, dropout=dropout_p, batch_first=False
+        )
+        self.norm1 = nn.LayerNorm(hidden_channels)
+        self.norm2 = nn.LayerNorm(hidden_channels)
+        
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels * 2),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.Dropout(dropout_p)
+        )
+        
+    def create_causal_mask(self, seq_len, device):
+        """Create causal attention mask with limited context window."""
+        mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
+        
+        for i in range(seq_len):
+            # Allow attention to previous tokens within context window
+            start_idx = max(0, i - self.context_window + 1)
+            mask[i, start_idx:i+1] = 0.0
+            
+        return mask
+        
+    def forward(self, x, x_mask):
+        # x: [B, C, T], x_mask: [B, 1, T]
+        B, C, T = x.shape
+        
+        # Transpose to [T, B, C] for MultiheadAttention
+        x = x.transpose(0, 2).transpose(1, 2)  # [T, B, C]
+        
+        # Create attention mask
+        attn_mask = self.create_causal_mask(T, x.device)
+        
+        # Create key padding mask from x_mask
+        key_padding_mask = (x_mask.squeeze(1) == 0)  # [B, T]
+        
+        # Self-attention with residual connection
+        residual = x
+        x = self.norm1(x)
+        attn_out, _ = self.attention(
+            x, x, x, 
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask
+        )
+        x = residual + attn_out
+        
+        # FFN with residual connection
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.ffn(x)
+        
+        # Transpose back to [B, C, T]
+        x = x.transpose(0, 1).transpose(1, 2)
+        
+        return x
+
+
 class TextEncoder(nn.Module):
     def __init__(
         self,
@@ -39,64 +173,101 @@ class TextEncoder(nn.Module):
         dropout_p: float,
         language_emb_dim: int = None,
     ):
-        """Text Encoder for VITS model.
+        """Optimized Hybrid Text Encoder for VITS model.
+        
+        Uses causal depthwise-separable convolutions for fast local feature extraction
+        followed by a single-layer transformer with limited context for semantic understanding.
 
         Args:
             n_vocab (int): Number of characters for the embedding layer.
             out_channels (int): Number of channels for the output.
             hidden_channels (int): Number of channels for the hidden layers.
-            hidden_channels_ffn (int): Number of channels for the convolutional layers.
-            num_heads (int): Number of attention heads for the Transformer layers.
-            num_layers (int): Number of Transformer layers.
-            kernel_size (int): Kernel size for the FFN layers in Transformer network.
-            dropout_p (float): Dropout rate for the Transformer layers.
+            hidden_channels_ffn (int): Number of channels for the convolutional layers (unused in this implementation).
+            num_heads (int): Number of attention heads for the Transformer layer.
+            num_layers (int): Number of layers (unused, we use fixed architecture).
+            kernel_size (int): Kernel size for the causal convolution layers.
+            dropout_p (float): Dropout rate for the layers.
+            language_emb_dim (int, optional): Language embedding dimension.
         """
         super().__init__()
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
-
+        
+        # Character embedding
         self.emb = nn.Embedding(n_vocab, hidden_channels)
-
         nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
-
+        
+        # Adjust hidden channels if language embedding is used
+        encoder_channels = hidden_channels
         if language_emb_dim:
-            hidden_channels += language_emb_dim
-
-        self.encoder = RelativePositionTransformer(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
+            encoder_channels += language_emb_dim
+            
+        # Project to consistent channel size if needed
+        self.input_proj = None
+        if encoder_channels != hidden_channels:
+            self.input_proj = nn.Conv1d(encoder_channels, hidden_channels, 1)
+        
+        # Fast local feature extraction with causal convolutions
+        self.conv_layers = nn.ModuleList([
+            CausalConvBlock(hidden_channels, kernel_size=kernel_size),
+            CausalConvBlock(hidden_channels, kernel_size=kernel_size)
+        ])
+        
+        # Limited context transformer for semantic understanding
+        self.transformer = LimitedContextTransformer(
             hidden_channels=hidden_channels,
-            hidden_channels_ffn=hidden_channels_ffn,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            kernel_size=kernel_size,
-            dropout_p=dropout_p,
-            layer_norm_type="2",
-            rel_attn_window_size=4,
+            num_heads=min(num_heads, 4),  # Cap at 4 heads for efficiency
+            context_window=32,  # Limited context window
+            dropout_p=dropout_p
         )
-
+        
+        # Output projection
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, x, x_lengths, lang_emb=None):
         """
         Shapes:
             - x: :math:`[B, T]`
-            - x_length: :math:`[B]`
+            - x_lengths: :math:`[B]`
+            - lang_emb: :math:`[B, lang_emb_dim, 1]`
         """
         assert x.shape[0] == x_lengths.shape[0]
-        x = self.emb(x) * math.sqrt(self.hidden_channels)  # [b, t, h]
-
-        # concat the lang emb in embedding chars
+        
+        # Character embedding
+        x = self.emb(x) * math.sqrt(self.hidden_channels)  # [B, T, H]
+        
+        # Concatenate language embedding if provided
         if lang_emb is not None:
-            x = torch.cat((x, lang_emb.transpose(2, 1).expand(x.size(0), x.size(1), -1)), dim=-1)
-
-        x = torch.transpose(x, 1, -1)  # [b, h, t]
-        x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)  # [b, 1, t]
-
-        x = self.encoder(x * x_mask, x_mask)
+            lang_emb_expanded = lang_emb.transpose(2, 1).expand(x.size(0), x.size(1), -1)
+            x = torch.cat((x, lang_emb_expanded), dim=-1)
+        
+        # Transpose to [B, C, T] for convolutions
+        x = x.transpose(1, 2)  # [B, H, T]
+        
+        # Create mask
+        x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype).to(x.device)  # [B, 1, T]
+        
+        # Project input if needed
+        if self.input_proj is not None:
+            x = self.input_proj(x)
+        
+        # Apply mask
+        x = x * x_mask
+        
+        # Fast local feature extraction with causal convolutions
+        for conv_layer in self.conv_layers:
+            x = conv_layer(x, x_mask)
+        
+        # Limited context transformer for semantic understanding
+        x = self.transformer(x, x_mask)
+        
+        # Apply mask again
+        x = x * x_mask
+        
+        # Output projection
         stats = self.proj(x) * x_mask
-
         m, logs = torch.split(stats, self.out_channels, dim=1)
+        
         return x, m, logs, x_mask
 
 
@@ -166,6 +337,161 @@ class ResidualCouplingBlock(nn.Module):
             return x
 
 
+class MiniWaveNet(nn.Module):
+    """Extremely small WaveNet with only 2 layers for efficient flow transformation."""
+    
+    def __init__(self, hidden_channels, kernel_size=3, cond_channels=0):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.cond_channels = cond_channels
+        
+        # Only 2 layers with minimal channels (64)
+        self.residual_channels = 64
+        
+        # Input projection
+        self.start = nn.Conv1d(hidden_channels, self.residual_channels, 1)
+        
+        # Two dilated convolution layers
+        self.conv1 = nn.Conv1d(
+            self.residual_channels, 
+            self.residual_channels * 2, 
+            kernel_size, 
+            dilation=1, 
+            padding=get_padding(kernel_size, 1)
+        )
+        
+        self.conv2 = nn.Conv1d(
+            self.residual_channels, 
+            self.residual_channels * 2, 
+            kernel_size, 
+            dilation=2, 
+            padding=get_padding(kernel_size, 2)
+        )
+        
+        # Conditioning projections if needed
+        if cond_channels > 0:
+            self.cond_proj1 = nn.Conv1d(cond_channels, self.residual_channels * 2, 1)
+            self.cond_proj2 = nn.Conv1d(cond_channels, self.residual_channels * 2, 1)
+        
+        # Residual and skip connections
+        self.res_proj1 = nn.Conv1d(self.residual_channels, self.residual_channels, 1)
+        self.res_proj2 = nn.Conv1d(self.residual_channels, self.residual_channels, 1)
+        
+        # Output projection
+        self.end = nn.Conv1d(self.residual_channels, hidden_channels, 1)
+        
+        # Initialize weights
+        self.apply(init_weights)
+        
+    def forward(self, x, x_mask, g=None):
+        """
+        Args:
+            x: [B, C, T] input tensor
+            x_mask: [B, 1, T] mask tensor
+            g: [B, C_cond, 1] conditioning tensor
+        """
+        x = self.start(x)
+        residual = x
+        
+        # Layer 1
+        h = self.conv1(x)
+        if g is not None and self.cond_channels > 0:
+            h = h + self.cond_proj1(g)
+        
+        # Gated activation
+        h_tanh, h_sigmoid = torch.split(h, self.residual_channels, dim=1)
+        h = torch.tanh(h_tanh) * torch.sigmoid(h_sigmoid)
+        
+        # Residual connection
+        x = self.res_proj1(h) + residual
+        x = x * x_mask
+        
+        # Layer 2
+        residual = x
+        h = self.conv2(x)
+        if g is not None and self.cond_channels > 0:
+            h = h + self.cond_proj2(g)
+        
+        # Gated activation
+        h_tanh, h_sigmoid = torch.split(h, self.residual_channels, dim=1)
+        h = torch.tanh(h_tanh) * torch.sigmoid(h_sigmoid)
+        
+        # Residual connection
+        x = self.res_proj2(h) + residual
+        x = x * x_mask
+        
+        # Output projection
+        x = self.end(x)
+        return x
+
+
+class OptimizedAffineCouplingLayer(nn.Module):
+    """Single Glow-like Affine Coupling Layer with extremely small WaveNet."""
+    
+    def __init__(self, channels, hidden_channels, cond_channels=0):
+        super().__init__()
+        assert channels % 2 == 0, "channels should be divisible by 2"
+        
+        self.half_channels = channels // 2
+        
+        # Extremely small WaveNet: 2 layers, 64 residual channels, kernel size 3
+        self.transform_net = MiniWaveNet(
+            hidden_channels=hidden_channels,
+            kernel_size=3,
+            cond_channels=cond_channels
+        )
+        
+        # Input projection
+        self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
+        
+        # Output projection for scale and translation
+        self.post = nn.Conv1d(hidden_channels, self.half_channels * 2, 1)
+        
+        # Initialize output layer to zero for training stability
+        nn.init.zeros_(self.post.weight)
+        nn.init.zeros_(self.post.bias)
+        
+    def forward(self, x, x_mask, g=None, reverse=False):
+        """
+        Args:
+            x: [B, C, T] input tensor
+            x_mask: [B, 1, T] mask tensor  
+            g: [B, C_cond, 1] conditioning tensor
+            reverse: bool, set True for inference
+        """
+        # Split input into two halves
+        x0, x1 = torch.split(x, [self.half_channels] * 2, dim=1)
+        
+        # Transform first half through network
+        h = self.pre(x0) * x_mask
+        h = self.transform_net(h, x_mask, g=g)
+        
+        # Get scale and translation parameters
+        params = self.post(h) * x_mask
+        scale, translation = torch.split(params, [self.half_channels] * 2, dim=1)
+        
+        # Apply affine transformation
+        if not reverse:
+            # Forward: x1 = x1 * exp(scale) + translation
+            x1 = x1 * torch.exp(scale) + translation
+            x1 = x1 * x_mask
+            logdet = torch.sum(scale * x_mask, [1, 2])
+        else:
+            # Reverse: x1 = (x1 - translation) * exp(-scale)
+            x1 = (x1 - translation) * torch.exp(-scale)
+            x1 = x1 * x_mask
+            logdet = -torch.sum(scale * x_mask, [1, 2])
+        
+        # Concatenate halves
+        x = torch.cat([x0, x1], dim=1)
+        
+        if not reverse:
+            return x, logdet
+        else:
+            return x
+
+
 class ResidualCouplingBlocks(nn.Module):
     def __init__(
         self,
@@ -177,58 +503,50 @@ class ResidualCouplingBlocks(nn.Module):
         num_flows=4,
         cond_channels=0,
     ):
-        """Redisual Coupling blocks for VITS flow layers.
-
+        """Optimized flow with single Glow-like Affine Coupling Layer.
+        
+        Replaces multiple ResidualCouplingBlocks with a single extremely efficient
+        affine coupling layer using a 2-layer WaveNet with 64 residual channels.
+        
         Args:
             channels (int): Number of input and output tensor channels.
-            hidden_channels (int): Number of hidden network channels.
-            kernel_size (int): Kernel size of the WaveNet layers.
-            dilation_rate (int): Dilation rate of the WaveNet layers.
-            num_layers (int): Number of the WaveNet layers.
-            num_flows (int, optional): Number of Residual Coupling blocks. Defaults to 4.
-            cond_channels (int, optional): Number of channels of the conditioning tensor. Defaults to 0.
+            hidden_channels (int): Number of hidden network channels (reduced to 64 internally).
+            kernel_size (int): Kernel size (fixed to 3 for efficiency).
+            dilation_rate (int): Dilation rate (unused in optimized version).
+            num_layers (int): Number of layers (unused, fixed to 2).
+            num_flows (int, optional): Number of flows (unused, fixed to 1).
+            cond_channels (int, optional): Number of conditioning channels.
         """
         super().__init__()
         self.channels = channels
-        self.hidden_channels = hidden_channels
-        self.kernel_size = kernel_size
-        self.dilation_rate = dilation_rate
-        self.num_layers = num_layers
-        self.num_flows = num_flows
+        self.hidden_channels = min(hidden_channels, 64)  # Cap at 64 for efficiency
         self.cond_channels = cond_channels
-
-        self.flows = nn.ModuleList()
-        for _ in range(num_flows):
-            self.flows.append(
-                ResidualCouplingBlock(
-                    channels,
-                    hidden_channels,
-                    kernel_size,
-                    dilation_rate,
-                    num_layers,
-                    cond_channels=cond_channels,
-                    mean_only=True,
-                )
-            )
-
+        
+        # Single optimized affine coupling layer
+        self.flow = OptimizedAffineCouplingLayer(
+            channels=channels,
+            hidden_channels=self.hidden_channels,
+            cond_channels=cond_channels
+        )
+        
     def forward(self, x, x_mask, g=None, reverse=False):
         """
-        Note:
-            Set `reverse` to True for inference.
-
-        Shapes:
-            - x: :math:`[B, C, T]`
-            - x_mask: :math:`[B, 1, T]`
-            - g: :math:`[B, C, 1]`
+        Args:
+            x: [B, C, T] input tensor
+            x_mask: [B, 1, T] mask tensor
+            g: [B, C_cond, 1] conditioning tensor
+            reverse: bool, set True for inference
         """
         if not reverse:
-            for flow in self.flows:
-                x, _ = flow(x, x_mask, g=g, reverse=reverse)
-                x = torch.flip(x, [1])
+            # Forward pass
+            x, logdet = self.flow(x, x_mask, g=g, reverse=False)
+            # Apply channel flip for better mixing
+            x = torch.flip(x, [1])
         else:
-            for flow in reversed(self.flows):
-                x = torch.flip(x, [1])
-                x = flow(x, x_mask, g=g, reverse=reverse)
+            # Reverse pass
+            x = torch.flip(x, [1])
+            x = self.flow(x, x_mask, g=g, reverse=True)
+            
         return x
 
 

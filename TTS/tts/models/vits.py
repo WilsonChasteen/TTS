@@ -24,6 +24,7 @@ from TTS.tts.layers.glow_tts.duration_predictor import DurationPredictor
 from TTS.tts.layers.vits.discriminator import VitsDiscriminator
 from TTS.tts.layers.vits.networks import PosteriorEncoder, ResidualCouplingBlocks, TextEncoder
 from TTS.tts.layers.vits.stochastic_duration_predictor import StochasticDurationPredictor
+from TTS.tts.layers.vits.balanced_duration_predictor import BalancedDurationPredictor, OptimizedDurationPredictor
 from TTS.tts.models.base_tts import BaseTTS
 from TTS.tts.utils.fairseq import rehash_fairseq_vits_checkpoint
 from TTS.tts.utils.helpers import generate_path, maximum_path, rand_segments, segment, sequence_mask
@@ -35,7 +36,7 @@ from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from TTS.tts.utils.visual import plot_alignment
 from TTS.utils.io import load_fsspec
 from TTS.utils.samplers import BucketBatchSampler
-from TTS.vocoder.models.hifigan_generator import HifiganGenerator
+from TTS.vocoder.models.univnet_generator import StreamlinedUnivNetGenerator
 from TTS.vocoder.utils.generic_utils import plot_results
 
 ##############################
@@ -598,6 +599,26 @@ class VitsArgs(Coqpit):
     interpolate_z: bool = True
     reinit_DP: bool = False
     reinit_text_encoder: bool = False
+    
+    # UnivNet specific parameters - optimized for 0.8-0.9 quality
+    lvc_block_nums: int = 4  # Increased for better quality
+    lvc_layers_each_block: int = 4  # Increased for better quality
+    lvc_kernel_size: int = 3
+    univnet_dropout: float = 0.0
+    
+    # Optimized Text Encoder parameters
+    use_optimized_text_encoder: bool = True
+    text_encoder_context_window: int = 32
+    text_encoder_conv_kernel_size: int = 5
+    
+    # Optimized Flow parameters
+    use_optimized_flow: bool = True
+    flow_hidden_channels: int = 96  # Balanced from 192 for efficiency and quality
+    
+    # Balanced Duration Predictor parameters
+    use_balanced_duration_predictor: bool = True
+    balanced_dp_hidden_channels: int = 192  # Increased for better quality (0.9+ target)
+    balanced_dp_inference_noise_scale: float = 0.2  # Moderate noise for natural variance
 
 
 class Vits(BaseTTS):
@@ -650,17 +671,72 @@ class Vits(BaseTTS):
         self.max_inference_len = self.args.max_inference_len
         self.spec_segment_size = self.args.spec_segment_size
 
-        self.text_encoder = TextEncoder(
-            self.args.num_chars,
-            self.args.hidden_channels,
-            self.args.hidden_channels,
-            self.args.hidden_channels_ffn_text_encoder,
-            self.args.num_heads_text_encoder,
-            self.args.num_layers_text_encoder,
-            self.args.kernel_size_text_encoder,
-            self.args.dropout_p_text_encoder,
-            language_emb_dim=self.embedded_language_dim,
-        )
+        if self.args.use_optimized_text_encoder:
+            # Use the new optimized hybrid text encoder
+            self.text_encoder = TextEncoder(
+                self.args.num_chars,
+                self.args.hidden_channels,
+                self.args.hidden_channels,
+                self.args.hidden_channels_ffn_text_encoder,
+                self.args.num_heads_text_encoder,
+                self.args.num_layers_text_encoder,
+                self.args.text_encoder_conv_kernel_size,
+                self.args.dropout_p_text_encoder,
+                language_emb_dim=self.embedded_language_dim,
+            )
+        else:
+            # Use the original text encoder for backward compatibility
+            from TTS.tts.layers.glow_tts.transformer import RelativePositionTransformer
+            
+            class OriginalTextEncoder(nn.Module):
+                def __init__(self, n_vocab, out_channels, hidden_channels, hidden_channels_ffn, 
+                           num_heads, num_layers, kernel_size, dropout_p, language_emb_dim=None):
+                    super().__init__()
+                    self.out_channels = out_channels
+                    self.hidden_channels = hidden_channels
+                    self.emb = nn.Embedding(n_vocab, hidden_channels)
+                    nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
+                    
+                    if language_emb_dim:
+                        hidden_channels += language_emb_dim
+                    
+                    self.encoder = RelativePositionTransformer(
+                        in_channels=hidden_channels,
+                        out_channels=hidden_channels,
+                        hidden_channels=hidden_channels,
+                        hidden_channels_ffn=hidden_channels_ffn,
+                        num_heads=num_heads,
+                        num_layers=num_layers,
+                        kernel_size=kernel_size,
+                        dropout_p=dropout_p,
+                        layer_norm_type="2",
+                        rel_attn_window_size=4,
+                    )
+                    self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+                
+                def forward(self, x, x_lengths, lang_emb=None):
+                    assert x.shape[0] == x_lengths.shape[0]
+                    x = self.emb(x) * math.sqrt(self.hidden_channels)
+                    if lang_emb is not None:
+                        x = torch.cat((x, lang_emb.transpose(2, 1).expand(x.size(0), x.size(1), -1)), dim=-1)
+                    x = torch.transpose(x, 1, -1)
+                    x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+                    x = self.encoder(x * x_mask, x_mask)
+                    stats = self.proj(x) * x_mask
+                    m, logs = torch.split(stats, self.out_channels, dim=1)
+                    return x, m, logs, x_mask
+            
+            self.text_encoder = OriginalTextEncoder(
+                self.args.num_chars,
+                self.args.hidden_channels,
+                self.args.hidden_channels,
+                self.args.hidden_channels_ffn_text_encoder,
+                self.args.num_heads_text_encoder,
+                self.args.num_layers_text_encoder,
+                self.args.kernel_size_text_encoder,
+                self.args.dropout_p_text_encoder,
+                language_emb_dim=self.embedded_language_dim,
+            )
 
         self.posterior_encoder = PosteriorEncoder(
             self.args.out_channels,
@@ -672,16 +748,30 @@ class Vits(BaseTTS):
             cond_channels=self.embedded_speaker_dim,
         )
 
+        # Use optimized flow with balanced hidden channels for quality and efficiency
+        flow_hidden_channels = self.args.flow_hidden_channels if hasattr(self.args, 'flow_hidden_channels') else 96
+        
         self.flow = ResidualCouplingBlocks(
             self.args.hidden_channels,
-            self.args.hidden_channels,
+            flow_hidden_channels,  # Reduced from hidden_channels for efficiency
             kernel_size=self.args.kernel_size_flow,
             dilation_rate=self.args.dilation_rate_flow,
             num_layers=self.args.num_layers_flow,
             cond_channels=self.embedded_speaker_dim,
         )
 
-        if self.args.use_sdp:
+        # Use balanced duration predictor for optimized real-time performance
+        if hasattr(self.args, 'use_balanced_duration_predictor') and self.args.use_balanced_duration_predictor:
+            self.duration_predictor = BalancedDurationPredictor(
+                self.args.hidden_channels,
+                hidden_channels=getattr(self.args, 'balanced_dp_hidden_channels', 192),  # Increased for better quality
+                kernel_size=3,
+                dropout_p=self.args.dropout_p_duration_predictor,
+                cond_channels=self.embedded_speaker_dim if self.args.condition_dp_on_speaker else 0,
+                language_emb_dim=self.embedded_language_dim,
+            )
+            self.use_sdp = False  # Balanced DP replaces SDP
+        elif self.args.use_sdp:
             self.duration_predictor = StochasticDurationPredictor(
                 self.args.hidden_channels,
                 192,
@@ -691,6 +781,7 @@ class Vits(BaseTTS):
                 cond_channels=self.embedded_speaker_dim if self.args.condition_dp_on_speaker else 0,
                 language_emb_dim=self.embedded_language_dim,
             )
+            self.use_sdp = True
         else:
             self.duration_predictor = DurationPredictor(
                 self.args.hidden_channels,
@@ -700,21 +791,23 @@ class Vits(BaseTTS):
                 cond_channels=self.embedded_speaker_dim,
                 language_emb_dim=self.embedded_language_dim,
             )
+            self.use_sdp = False
 
-        self.waveform_decoder = HifiganGenerator(
-            self.args.hidden_channels,
-            1,
-            self.args.resblock_type_decoder,
-            self.args.resblock_dilation_sizes_decoder,
-            self.args.resblock_kernel_sizes_decoder,
-            self.args.upsample_kernel_sizes_decoder,
-            self.args.upsample_initial_channel_decoder,
-            self.args.upsample_rates_decoder,
-            inference_padding=0,
+        self.waveform_decoder = StreamlinedUnivNetGenerator(
+            in_channels=self.args.hidden_channels,
+            out_channels=1,
+            hidden_channels=512,  # Increased for 0.8-0.9 quality target
+            upsample_factors=self.args.upsample_rates_decoder,
+            upsample_kernel_sizes=self.args.upsample_kernel_sizes_decoder,
+            lvc_block_nums=4,  # Increased for better quality
+            lvc_layers_each_block=4,  # Increased for better quality
+            lvc_kernel_size=self.args.lvc_kernel_size,
+            dropout=self.args.univnet_dropout,
             cond_channels=self.embedded_speaker_dim,
-            conv_pre_weight_norm=False,
-            conv_post_weight_norm=False,
-            conv_post_bias=False,
+            conv_pre_weight_norm=True,
+            conv_post_weight_norm=True,
+            conv_post_bias=True,
+            inference_padding=0,
         )
 
         if self.args.init_discriminator:
@@ -920,7 +1013,7 @@ class Vits(BaseTTS):
 
         # duration predictor
         attn_durations = attn.sum(3)
-        if self.args.use_sdp:
+        if hasattr(self, 'use_sdp') and self.use_sdp:
             loss_duration = self.duration_predictor(
                 x.detach() if self.args.detach_dp_input else x,
                 x_mask,
@@ -930,6 +1023,7 @@ class Vits(BaseTTS):
             )
             loss_duration = loss_duration / torch.sum(x_mask)
         else:
+            # For both balanced DP and original DP, use MSE loss on log durations
             attn_log_durations = torch.log(attn_durations + 1e-6) * x_mask
             log_durations = self.duration_predictor(
                 x.detach() if self.args.detach_dp_input else x,
@@ -1124,7 +1218,7 @@ class Vits(BaseTTS):
         x, m_p, logs_p, x_mask = self.text_encoder(x, x_lengths, lang_emb=lang_emb)
 
         if durations is None:
-            if self.args.use_sdp:
+            if hasattr(self, 'use_sdp') and self.use_sdp:
                 logw = self.duration_predictor(
                     x,
                     x_mask,
@@ -1132,6 +1226,16 @@ class Vits(BaseTTS):
                     reverse=True,
                     noise_scale=self.inference_noise_scale_dp,
                     lang_emb=lang_emb,
+                )
+            elif isinstance(self.duration_predictor, BalancedDurationPredictor):
+                # Use the optimized inference method with controlled noise
+                noise_scale = getattr(self.args, 'balanced_dp_inference_noise_scale', 0.1)
+                logw = self.duration_predictor.inference(
+                    x, 
+                    x_mask, 
+                    g=g if self.args.condition_dp_on_speaker else None, 
+                    lang_emb=lang_emb,
+                    noise_scale=noise_scale
                 )
             else:
                 logw = self.duration_predictor(
