@@ -217,7 +217,7 @@ class TextEncoder(nn.Module):
         self.transformer = LimitedContextTransformer(
             hidden_channels=hidden_channels,
             num_heads=min(num_heads, 4),  # Cap at 4 heads for efficiency
-            context_window=32,  # Limited context window
+            context_window=64,  # Limited context window
             dropout_p=dropout_p
         )
         

@@ -36,7 +36,7 @@ from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from TTS.tts.utils.visual import plot_alignment
 from TTS.utils.io import load_fsspec
 from TTS.utils.samplers import BucketBatchSampler
-from TTS.vocoder.models.univnet_generator import StreamlinedUnivNetGenerator
+from TTS.vocoder.models.univnet_generator import StreamlinedUnivNetGenerator, UltraHighQualityVoiceEncoder
 from TTS.vocoder.utils.generic_utils import plot_results
 
 ##############################
@@ -619,6 +619,12 @@ class VitsArgs(Coqpit):
     use_balanced_duration_predictor: bool = True
     balanced_dp_hidden_channels: int = 192  # Increased for better quality (0.9+ target)
     balanced_dp_inference_noise_scale: float = 0.2  # Moderate noise for natural variance
+    
+    # Enhanced Voice Encoder parameters
+    use_enhanced_voice_encoder: bool = True  # Enable the new UltraHighQualityVoiceEncoder
+    enhanced_encoder_conformer: bool = True  # Enable Conformer blocks for global context
+    enhanced_encoder_diffusion: bool = True  # Enable diffusion refinement
+    enhanced_encoder_streaming_buffer: int = 512  # Buffer size for real-time processing
 
 
 class Vits(BaseTTS):
@@ -793,22 +799,37 @@ class Vits(BaseTTS):
             )
             self.use_sdp = False
 
-        self.waveform_decoder = StreamlinedUnivNetGenerator(
-            in_channels=self.args.hidden_channels,
-            out_channels=1,
-            hidden_channels=512,  # Increased for 0.8-0.9 quality target
-            upsample_factors=self.args.upsample_rates_decoder,
-            upsample_kernel_sizes=self.args.upsample_kernel_sizes_decoder,
-            lvc_block_nums=4,  # Increased for better quality
-            lvc_layers_each_block=4,  # Increased for better quality
-            lvc_kernel_size=self.args.lvc_kernel_size,
-            dropout=self.args.univnet_dropout,
-            cond_channels=self.embedded_speaker_dim,
-            conv_pre_weight_norm=True,
-            conv_post_weight_norm=True,
-            conv_post_bias=True,
-            inference_padding=0,
-        )
+        # Use the enhanced voice encoder for high-quality output
+        if hasattr(self.args, 'use_enhanced_voice_encoder') and self.args.use_enhanced_voice_encoder:
+            self.waveform_decoder = UltraHighQualityVoiceEncoder(
+                in_channels=self.args.hidden_channels,
+                out_channels=1,
+                hidden_channels=512,  # Optimized for quality
+                upsample_factors=self.args.upsample_rates_decoder,
+                lvc_blocks_per_stage=4,  # Increased for better quality
+                cond_channels=self.embedded_speaker_dim,
+                use_conformer=True,  # Enable global context modeling
+                use_diffusion=True,  # Enable diffusion refinement
+                streaming_buffer_size=512,  # Optimized for real-time
+            )
+        else:
+            # Backward compatibility with StreamlinedUnivNetGenerator
+            self.waveform_decoder = StreamlinedUnivNetGenerator(
+                in_channels=self.args.hidden_channels,
+                out_channels=1,
+                hidden_channels=512,  # Increased for 0.8-0.9 quality target
+                upsample_factors=self.args.upsample_rates_decoder,
+                upsample_kernel_sizes=self.args.upsample_kernel_sizes_decoder,
+                lvc_block_nums=4,  # Increased for better quality
+                lvc_layers_each_block=4,  # Increased for better quality
+                lvc_kernel_size=self.args.lvc_kernel_size,
+                dropout=self.args.univnet_dropout,
+                cond_channels=self.embedded_speaker_dim,
+                conv_pre_weight_norm=True,
+                conv_post_weight_norm=True,
+                conv_post_bias=True,
+                inference_padding=0,
+            )
 
         if self.args.init_discriminator:
             self.disc = VitsDiscriminator(
@@ -1262,7 +1283,14 @@ class Vits(BaseTTS):
         # upsampling if needed
         z, _, _, y_mask = self.upsampling_z(z, y_lengths=y_lengths, y_mask=y_mask)
 
-        o = self.waveform_decoder((z * y_mask)[:, :, : self.max_inference_len], g=g)
+        # Use enhanced inference if available
+        z_masked = (z * y_mask)[:, :, : self.max_inference_len]
+        if hasattr(self.waveform_decoder, 'inference') and isinstance(self.waveform_decoder, UltraHighQualityVoiceEncoder):
+            # Use high-quality inference mode for enhanced voice encoder
+            o = self.waveform_decoder.inference(z_masked, c=g, high_quality=True)
+        else:
+            # Standard inference for backward compatibility
+            o = self.waveform_decoder(z_masked, g=g)
 
         outputs = {
             "model_outputs": o,
@@ -1986,6 +2014,27 @@ class Vits(BaseTTS):
             self.train()
         if not disc is None:
             self.disc = disc
+
+    def optimize_for_inference(self, use_mps=True):
+        """Optimize the model for inference performance"""
+        self.eval()
+        
+        # Optimize the waveform decoder if it's the enhanced version
+        if isinstance(self.waveform_decoder, UltraHighQualityVoiceEncoder):
+            try:
+                from TTS.vocoder.models.univnet_generator import optimize_for_inference
+                self.waveform_decoder = optimize_for_inference(self.waveform_decoder, use_mps=use_mps)
+                print(" > Enhanced voice encoder optimized for inference")
+            except ImportError:
+                print(" > Optimization functions not available, using standard model")
+        
+        # Set to MPS if available and requested
+        if use_mps and torch.backends.mps.is_available():
+            device = torch.device("mps")
+            self.to(device)
+            print(" > Model moved to MPS device")
+        
+        return self
 
     def load_onnx(self, model_path: str, cuda=False):
         import onnxruntime as ort
